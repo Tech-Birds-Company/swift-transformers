@@ -18,6 +18,7 @@ final class Downloader: NSObject, Sendable {
     private let incompleteDestination: URL
     private let downloadResumeState: DownloadResumeState = .init()
     private let chunkSize: Int
+    private let useBackgroundSession: Bool
 
     /// Represents the current state of a download operation.
     enum DownloadState {
@@ -39,6 +40,8 @@ final class Downloader: NSObject, Sendable {
         case unexpectedError
         /// The temporary file could not be found during resume.
         case tempFileNotFound
+        /// HTTP error with status code.
+        case httpError(Int)
     }
 
     private let broadcaster: Broadcaster<DownloadState> = Broadcaster<DownloadState> {
@@ -48,6 +51,9 @@ final class Downloader: NSObject, Sendable {
     private let sessionConfig: URLSessionConfiguration
     let session: SessionActor = .init()
     private let task: TaskActor = .init()
+    
+    /// Actor to manage background download task completion
+    private let backgroundDownloadState: BackgroundDownloadState = .init()
 
     /// Initializes a new downloader instance.
     ///
@@ -66,8 +72,9 @@ final class Downloader: NSObject, Sendable {
         // Create incomplete file path based on destination
         self.incompleteDestination = incompleteDestination
         self.chunkSize = chunkSize
+        self.useBackgroundSession = inBackground
 
-        let sessionIdentifier = "swift-transformers.hub.downloader"
+        let sessionIdentifier = "swift-transformers.hub.downloader.\(destination.lastPathComponent.hashValue)"
 
         var config = URLSessionConfiguration.default
         if inBackground {
@@ -189,24 +196,27 @@ final class Downloader: NSObject, Sendable {
                     request.timeoutInterval = timeout
                     request.allHTTPHeaderFields = requestHeaders
 
-                    // Open the incomplete file for writing
-                    let tempFile = try FileHandle(forWritingTo: self.incompleteDestination)
+                    // Use different download strategy based on session type
+                    if self.useBackgroundSession {
+                        // Background session: use downloadTask which works when app is suspended
+                        try await self.backgroundDownload(request: request, numRetries: numRetries)
+                    } else {
+                        // Foreground session: use streaming bytes API for better progress tracking
+                        // Open the incomplete file for writing
+                        let tempFile = try FileHandle(forWritingTo: self.incompleteDestination)
 
-                    // If resuming, seek to end of file
-                    if resumeSize > 0 {
-                        try tempFile.seekToEnd()
+                        // If resuming, seek to end of file
+                        if resumeSize > 0 {
+                            try tempFile.seekToEnd()
+                        }
+
+                        defer { tempFile.closeFile() }
+
+                        try await self.httpGet(request: request, tempFile: tempFile, numRetries: numRetries)
+
+                        try Task.checkCancellation()
+                        try FileManager.default.moveDownloadedFile(from: self.incompleteDestination, to: self.destination)
                     }
-
-                    defer { tempFile.closeFile() }
-
-                    try await self.httpGet(request: request, tempFile: tempFile, numRetries: numRetries)
-
-                    try Task.checkCancellation()
-                    try FileManager.default.moveDownloadedFile(from: self.incompleteDestination, to: self.destination)
-
-                    //                    // Clean up and move the completed download to its final destination
-                    //                    tempFile.closeFile()
-                    //                    try FileManager.default.moveDownloadedFile(from: tempURL, to: self.destination)
 
                     await self.broadcaster.broadcast(state: .completed(self.destination))
                 } catch {
@@ -214,6 +224,47 @@ final class Downloader: NSObject, Sendable {
                 }
             }
         )
+    }
+    
+    /// Performs download using URLSession downloadTask (works in background)
+    ///
+    /// - Parameters:
+    ///   - request: The URLRequest for the file to download
+    ///   - numRetries: The number of retry attempts remaining for failed downloads
+    private func backgroundDownload(
+        request: URLRequest,
+        numRetries: Int
+    ) async throws {
+        guard let session = await session.get() else {
+            throw DownloadError.unexpectedError
+        }
+        
+        // Reset background download state
+        await backgroundDownloadState.reset()
+        
+        // Create and start download task
+        let downloadTask = session.downloadTask(with: request)
+        downloadTask.resume()
+        
+        // Wait for download to complete via delegate callbacks
+        let result = await backgroundDownloadState.waitForCompletion()
+        
+        switch result {
+        case .success(let tempURL):
+            // Move file from temp location to destination
+            try Task.checkCancellation()
+            try FileManager.default.moveDownloadedFile(from: tempURL, to: destination)
+            
+        case .failure(let error):
+            // Retry logic
+            if numRetries > 0 {
+                try await Task.sleep(nanoseconds: 1_000_000_000)
+                await self.session.set(URLSession(configuration: self.sessionConfig, delegate: self, delegateQueue: nil))
+                try await backgroundDownload(request: request, numRetries: numRetries - 1)
+            } else {
+                throw error
+            }
+        }
     }
 
     /// Downloads a file from given URL using chunked transfer and handles retries.
@@ -360,21 +411,27 @@ final class Downloader: NSObject, Sendable {
 
 extension Downloader: URLSessionDownloadDelegate {
     func urlSession(_: URLSession, downloadTask: URLSessionDownloadTask, didWriteData _: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
+        let progress = totalBytesExpectedToWrite > 0 
+            ? Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) 
+            : 0
         Task {
-            await self.broadcaster.broadcast(state: .downloading(Double(totalBytesWritten) / Double(totalBytesExpectedToWrite), nil))
+            await self.broadcaster.broadcast(state: .downloading(progress, nil))
         }
     }
 
-    func urlSession(_: URLSession, downloadTask _: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+    func urlSession(_: URLSession, downloadTask: URLSessionDownloadTask, didFinishDownloadingTo location: URL) {
+        // Copy file to a safe location before the system deletes it
+        let tempDir = FileManager.default.temporaryDirectory
+        let safeTempURL = tempDir.appendingPathComponent(UUID().uuidString + "_" + location.lastPathComponent)
+        
         do {
-            // If the downloaded file already exists on the filesystem, overwrite it
-            try FileManager.default.moveDownloadedFile(from: location, to: destination)
+            try FileManager.default.copyItem(at: location, to: safeTempURL)
             Task {
-                await self.broadcaster.broadcast(state: .completed(destination))
+                await self.backgroundDownloadState.complete(with: .success(safeTempURL))
             }
         } catch {
             Task {
-                await self.broadcaster.broadcast(state: .failed(error))
+                await self.backgroundDownloadState.complete(with: .failure(error))
             }
         }
     }
@@ -382,13 +439,11 @@ extension Downloader: URLSessionDownloadDelegate {
     func urlSession(_ session: URLSession, task: URLSessionTask, didCompleteWithError error: Error?) {
         if let error {
             Task {
+                await self.backgroundDownloadState.complete(with: .failure(error))
                 await self.broadcaster.broadcast(state: .failed(error))
             }
-            //        } else if let response = task.response as? HTTPURLResponse {
-            //            print("HTTP response status code: \(response.statusCode)")
-            //            let headers = response.allHeaderFields
-            //            print("HTTP response headers: \(headers)")
         }
+        // Note: Success case is handled in didFinishDownloadingTo
     }
 }
 
@@ -491,5 +546,41 @@ actor TaskActor {
 
     func get() -> Task<Void, Error>? {
         task
+    }
+}
+
+/// Actor to manage background download task completion signaling
+private actor BackgroundDownloadState {
+    private var continuation: CheckedContinuation<Result<URL, Error>, Never>?
+    private var result: Result<URL, Error>?
+    
+    /// Resets the state for a new download
+    func reset() {
+        continuation = nil
+        result = nil
+    }
+    
+    /// Waits for the download to complete and returns the result
+    func waitForCompletion() async -> Result<URL, Error> {
+        // If result is already available, return it immediately
+        if let result {
+            return result
+        }
+        
+        // Otherwise, wait for completion signal
+        return await withCheckedContinuation { cont in
+            self.continuation = cont
+        }
+    }
+    
+    /// Signals that the download has completed
+    func complete(with result: Result<URL, Error>) {
+        self.result = result
+        
+        // If someone is waiting, resume them
+        if let continuation {
+            continuation.resume(returning: result)
+            self.continuation = nil
+        }
     }
 }

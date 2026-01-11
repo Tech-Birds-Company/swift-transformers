@@ -51,7 +51,7 @@ final class Downloader: NSObject, Sendable {
     private let sessionConfig: URLSessionConfiguration
     let session: SessionActor = .init()
     private let task: TaskActor = .init()
-    
+
     /// Actor to manage background download task completion
     private let backgroundDownloadState: BackgroundDownloadState = .init()
 
@@ -225,12 +225,13 @@ final class Downloader: NSObject, Sendable {
             }
         )
     }
-    
+
     /// Performs download using URLSession downloadTask (works in background)
     ///
     /// - Parameters:
     ///   - request: The URLRequest for the file to download
     ///   - numRetries: The number of retry attempts remaining for failed downloads
+    /// - Throws: `DownloadError.unexpectedError` if the response is invalid
     private func backgroundDownload(
         request: URLRequest,
         numRetries: Int
@@ -238,23 +239,23 @@ final class Downloader: NSObject, Sendable {
         guard let session = await session.get() else {
             throw DownloadError.unexpectedError
         }
-        
+
         // Reset background download state
         await backgroundDownloadState.reset()
-        
+
         // Create and start download task
         let downloadTask = session.downloadTask(with: request)
         downloadTask.resume()
-        
+
         // Wait for download to complete via delegate callbacks
         let result = await backgroundDownloadState.waitForCompletion()
-        
+
         switch result {
         case .success(let tempURL):
             // Move file from temp location to destination
             try Task.checkCancellation()
             try FileManager.default.moveDownloadedFile(from: tempURL, to: destination)
-            
+
         case .failure(let error):
             // Retry logic
             if numRetries > 0 {
@@ -410,10 +411,9 @@ final class Downloader: NSObject, Sendable {
 }
 
 extension Downloader: URLSessionDownloadDelegate {
+
     func urlSession(_: URLSession, downloadTask: URLSessionDownloadTask, didWriteData _: Int64, totalBytesWritten: Int64, totalBytesExpectedToWrite: Int64) {
-        let progress = totalBytesExpectedToWrite > 0 
-            ? Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) 
-            : 0
+        let progress = totalBytesExpectedToWrite > 0 ? Double(totalBytesWritten) / Double(totalBytesExpectedToWrite) : 0
         Task {
             await self.broadcaster.broadcast(state: .downloading(progress, nil))
         }
@@ -423,7 +423,7 @@ extension Downloader: URLSessionDownloadDelegate {
         // Copy file to a safe location before the system deletes it
         let tempDir = FileManager.default.temporaryDirectory
         let safeTempURL = tempDir.appendingPathComponent(UUID().uuidString + "_" + location.lastPathComponent)
-        
+
         do {
             try FileManager.default.copyItem(at: location, to: safeTempURL)
             Task {
@@ -553,30 +553,30 @@ actor TaskActor {
 private actor BackgroundDownloadState {
     private var continuation: CheckedContinuation<Result<URL, Error>, Never>?
     private var result: Result<URL, Error>?
-    
+
     /// Resets the state for a new download
     func reset() {
         continuation = nil
         result = nil
     }
-    
+
     /// Waits for the download to complete and returns the result
     func waitForCompletion() async -> Result<URL, Error> {
         // If result is already available, return it immediately
         if let result {
             return result
         }
-        
+
         // Otherwise, wait for completion signal
         return await withCheckedContinuation { cont in
             self.continuation = cont
         }
     }
-    
+
     /// Signals that the download has completed
     func complete(with result: Result<URL, Error>) {
         self.result = result
-        
+
         // If someone is waiting, resume them
         if let continuation {
             continuation.resume(returning: result)
